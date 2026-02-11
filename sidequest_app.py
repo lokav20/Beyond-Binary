@@ -10,51 +10,50 @@ from typing import Dict, List, Optional, Set, Tuple
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
-
 
 # -----------------------------
 # Models (API request/response)
 # -----------------------------
 
+app = FastAPI(title="SideQuest Prototype API", version="1.0")
+
 class UserCreate(BaseModel):
     display_name: str = Field(..., example="Alex")
-    default_energy: str = Field(default="neutral", pattern="^(low|neutral|high)$", example="neutral")
-    social_style: str = Field(default="either", pattern="^(quiet|talkative|either)$", example="either")
-    mode: str = Field(default="either", pattern="^(online|offline|either)$", example="either")
-    interests: List[str] = Field(default_factory=list, example=["gaming", "reading"])
-    area: str = Field(default="NTU", example="NTU")
+    password: str = Field(..., min_length=3)
+    default_energy: str = Field(default="neutral", pattern="^(low|neutral|high)$")
+    social_style: str = Field(default="either", pattern="^(quiet|talkative|either)$")
+    mode: str = Field(default="either", pattern="^(online|offline|either)$")
+    interests: List[str] = Field(default_factory=list)
+    area: str = Field(default="NTU")
 
-
-class UserCheckIn(BaseModel):
-    energy: str = Field(pattern="^(low|neutral|high)$")
-
+class UserLogin(BaseModel):
+    display_name: str
+    password: str
 
 class QuestCreate(BaseModel):
+    organizer_id: str
     title: str
     description: str
     area: str = "NTU"
-    # "quiet" | "talkative" | "either"
     social_style: str = Field(default="either", pattern="^(quiet|talkative|either)$")
-    # "online" | "offline" | "either"
     mode: str = Field(default="either", pattern="^(online|offline|either)$")
     tags: List[str] = Field(default_factory=list)
-    start_time_iso: str  # ISO string like "2026-02-11T19:00:00"
+    start_time_iso: str
     duration_mins: int = Field(ge=10, le=240)
     capacity: int = Field(ge=2, le=50)
 
-
 class JoinQuest(BaseModel):
     user_id: str
-
 
 class CompleteQuest(BaseModel):
     user_id: str
     connectedness_rating: int = Field(ge=1, le=5)
 
-
 class QuestOut(BaseModel):
     quest_id: str
+    organizer_name: str
     title: str
     description: str
     area: str
@@ -66,45 +65,35 @@ class QuestOut(BaseModel):
     capacity: int
     participants: int
     score: Optional[float] = None
-
+    has_joined: bool = False
+    is_completed: bool = False
 
 class DashboardOut(BaseModel):
     area: str
-    # engagement
     active_users_7d: int
     quests_created_7d: int
     joins_7d: int
-    completions_7d: int
-    repeat_participation_rate_30d: float
-    avg_connectedness_7d: Optional[float]
-    time_to_first_connection_hours_avg: Optional[float]
-    # what works
-    top_tags_7d: List[Tuple[str, int]]
-
 
 # -----------------------------
-# In-memory storage (prototype)
+# In-memory storage
 # -----------------------------
 
 @dataclass
 class User:
     user_id: str
     display_name: str
+    password: str
     default_energy: str
     social_style: str
     mode: str
     interests: Set[str]
     area: str
-    last_checkin_energy: str = "neutral"
-    last_checkin_at: Optional[datetime] = None
     created_at: datetime = field(default_factory=datetime.utcnow)
-    first_join_at: Optional[datetime] = None
-    last_join_at: Optional[datetime] = None
-
 
 @dataclass
 class Quest:
     quest_id: str
+    organizer_id: str
     title: str
     description: str
     area: str
@@ -116,223 +105,73 @@ class Quest:
     capacity: int
     created_at: datetime = field(default_factory=datetime.utcnow)
     participant_ids: Set[str] = field(default_factory=set)
-    completions: Dict[str, int] = field(default_factory=dict)  # user_id -> rating (1-5)
-
+    completions: Dict[str, int] = field(default_factory=dict) # user_id -> rating
 
 USERS: Dict[str, User] = {}
 QUESTS: Dict[str, Quest] = {}
 
-# For simple analytics
-EVENT_LOG: List[Tuple[str, datetime, Dict]] = []  # (event_type, timestamp, payload)
-
-
-def log_event(event_type: str, payload: Dict):
-    EVENT_LOG.append((event_type, datetime.utcnow(), payload))
-
-
 # -----------------------------
-# Matching / scoring logic
+# Logic Helpers
 # -----------------------------
 
 def parse_iso(dt_str: str) -> datetime:
     try:
+        dt_str = dt_str.replace('Z', '+00:00')
         return datetime.fromisoformat(dt_str)
     except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid datetime format. Use ISO, e.g. 2026-02-11T19:00:00")
-
-
-def within_next_hours(q: Quest, hours: int = 48) -> bool:
-    now = datetime.utcnow()
-    return now <= q.start_time <= now + timedelta(hours=hours)
-
-
-def preference_match(user_val: str, quest_val: str) -> float:
-    """
-    Returns a score contribution [0..1] for matching fields like mode/social_style.
-    """
-    if user_val == "either" or quest_val == "either":
-        return 0.7
-    return 1.0 if user_val == quest_val else 0.0
-
-
-def energy_fit(user_energy: str, quest: Quest) -> float:
-    """
-    Low energy users should prefer smaller/quieter/shorter quests.
-    High energy users can handle talkative/longer/groupy.
-    """
-    base = 0.5
-    if user_energy == "low":
-        # reward short + quiet
-        base += 0.2 if quest.duration_mins <= 45 else -0.1
-        base += 0.2 if quest.social_style in ("quiet", "either") else -0.1
-    elif user_energy == "high":
-        # reward talkative + longer
-        base += 0.2 if quest.duration_mins >= 60 else 0.0
-        base += 0.2 if quest.social_style in ("talkative", "either") else 0.0
-    else:
-        # neutral: prefer balanced
-        base += 0.1 if 30 <= quest.duration_mins <= 90 else 0.0
-    return max(0.0, min(1.0, base))
-
-
-def tag_overlap(user_tags: Set[str], quest_tags: Set[str]) -> float:
-    if not user_tags or not quest_tags:
-        return 0.2  # small default value
-    overlap = len(user_tags.intersection(quest_tags))
-    return min(1.0, 0.2 + 0.2 * overlap)
-
+        raise HTTPException(status_code=400, detail="Invalid datetime format.")
 
 def capacity_available(q: Quest) -> bool:
     return len(q.participant_ids) < q.capacity
 
-
-def recommend_quests_for_user(user: User, top_k: int = 3) -> List[Tuple[Quest, float]]:
-    candidates: List[Tuple[Quest, float]] = []
-
-    for q in QUESTS.values():
-        # basic filters
-        if q.area != user.area:
-            continue
-        if not within_next_hours(q, 72):
-            continue
-        if not capacity_available(q):
-            continue
-        if user.user_id in q.participant_ids:
-            continue
-
-        # scoring
-        score = 0.0
-        score += 0.35 * preference_match(user.mode, q.mode)
-        score += 0.25 * preference_match(user.social_style, q.social_style)
-        score += 0.25 * energy_fit(user.last_checkin_energy, q)
-        score += 0.15 * tag_overlap(user.interests, q.tags)
-
-        candidates.append((q, score))
-
-    # sort by score desc
-    candidates.sort(key=lambda x: x[1], reverse=True)
-    return candidates[:top_k]
-
+def get_organizer_name(uid: str) -> str:
+    u = USERS.get(uid)
+    return u.display_name if u else "Unknown"
 
 # -----------------------------
-# Analytics helpers
+# Endpoints
 # -----------------------------
 
-def since(ts: datetime, days: int) -> List[Tuple[str, datetime, Dict]]:
-    cutoff = ts - timedelta(days=days)
-    return [e for e in EVENT_LOG if e[1] >= cutoff]
-
-
-def safe_div(a: float, b: float) -> float:
-    return a / b if b else 0.0
-
-
-def dashboard(area: str) -> DashboardOut:
-    now = datetime.utcnow()
-    events_7d = [e for e in since(now, 7) if e[2].get("area") == area]
-    events_30d = [e for e in since(now, 30) if e[2].get("area") == area]
-
-    # active users = users who checked in or joined/completed within 7d
-    active_users: Set[str] = set()
-    for et, _, payload in events_7d:
-        uid = payload.get("user_id")
-        if uid:
-            active_users.add(uid)
-
-    quests_created_7d = sum(1 for et, _, _ in events_7d if et == "quest_created")
-    joins_7d = sum(1 for et, _, _ in events_7d if et == "quest_joined")
-    completions_7d = sum(1 for et, _, _ in events_7d if et == "quest_completed")
-
-    # repeat participation rate: users with >=2 joins in last 30d / users with >=1 join in last 30d
-    join_counts: Dict[str, int] = {}
-    for et, _, payload in events_30d:
-        if et == "quest_joined":
-            uid = payload.get("user_id")
-            if uid:
-                join_counts[uid] = join_counts.get(uid, 0) + 1
-
-    users_with_join = sum(1 for v in join_counts.values() if v >= 1)
-    users_with_repeat = sum(1 for v in join_counts.values() if v >= 2)
-    repeat_rate = safe_div(users_with_repeat, users_with_join)
-
-    # avg connectedness rating last 7d
-    ratings = [payload["rating"] for et, _, payload in events_7d if et == "quest_completed"]
-    avg_connectedness = (sum(ratings) / len(ratings)) if ratings else None
-
-    # time to first connection (join) in hours avg: from user created_at -> first_join_at
-    ttf_list: List[float] = []
+@app.post("/users/login")
+def login_user(body: UserLogin):
     for u in USERS.values():
-        if u.area != area:
-            continue
-        if u.first_join_at is not None:
-            ttf_list.append((u.first_join_at - u.created_at).total_seconds() / 3600.0)
-    ttf_avg = (sum(ttf_list) / len(ttf_list)) if ttf_list else None
-
-    # top tags 7d by joins
-    tag_counts: Dict[str, int] = {}
-    for et, _, payload in events_7d:
-        if et == "quest_joined":
-            qid = payload.get("quest_id")
-            if qid and qid in QUESTS:
-                for t in QUESTS[qid].tags:
-                    tag_counts[t] = tag_counts.get(t, 0) + 1
-    top_tags = sorted(tag_counts.items(), key=lambda x: x[1], reverse=True)[:5]
-
-    return DashboardOut(
-        area=area,
-        active_users_7d=len(active_users),
-        quests_created_7d=quests_created_7d,
-        joins_7d=joins_7d,
-        completions_7d=completions_7d,
-        repeat_participation_rate_30d=round(repeat_rate, 4),
-        avg_connectedness_7d=(round(avg_connectedness, 2) if avg_connectedness is not None else None),
-        time_to_first_connection_hours_avg=(round(ttf_avg, 2) if ttf_avg is not None else None),
-        top_tags_7d=top_tags,
-    )
-
-
-# -----------------------------
-# FastAPI app + endpoints
-# -----------------------------
-
-app = FastAPI(title="SideQuest Prototype API", version="1.0")
-
+        if u.display_name.lower() == body.display_name.lower():
+            if u.password == body.password:
+                return {"user_id": u.user_id, "display_name": u.display_name, "area": u.area}
+            else:
+                raise HTTPException(status_code=401, detail="Incorrect password.")
+    raise HTTPException(status_code=404, detail="User not found.")
 
 @app.post("/users")
 def create_user(body: UserCreate):
+    for u in USERS.values():
+        if u.display_name.lower() == body.display_name.lower():
+             raise HTTPException(status_code=400, detail="Name already taken.")
+             
     user_id = str(uuid4())
     u = User(
         user_id=user_id,
         display_name=body.display_name,
+        password=body.password,
         default_energy=body.default_energy,
         social_style=body.social_style,
         mode=body.mode,
         interests=set(t.lower() for t in body.interests),
         area=body.area,
-        last_checkin_energy=body.default_energy,
     )
     USERS[user_id] = u
-    log_event("user_created", {"user_id": user_id, "area": u.area})
-    return {"user_id": user_id}
-
-
-@app.post("/users/{user_id}/checkin")
-def user_checkin(user_id: str, body: UserCheckIn):
-    u = USERS.get(user_id)
-    if not u:
-        raise HTTPException(status_code=404, detail="User not found")
-    u.last_checkin_energy = body.energy
-    u.last_checkin_at = datetime.utcnow()
-    log_event("user_checkin", {"user_id": user_id, "area": u.area, "energy": body.energy})
-    return {"ok": True}
-
+    return {"user_id": user_id, "display_name": u.display_name}
 
 @app.post("/quests")
 def create_quest(body: QuestCreate):
+    if body.organizer_id not in USERS:
+        raise HTTPException(status_code=404, detail="Organizer (User) not found")
+        
     start_time = parse_iso(body.start_time_iso)
     quest_id = str(uuid4())
     q = Quest(
         quest_id=quest_id,
+        organizer_id=body.organizer_id,
         title=body.title,
         description=body.description,
         area=body.area,
@@ -344,22 +183,55 @@ def create_quest(body: QuestCreate):
         capacity=body.capacity,
     )
     QUESTS[quest_id] = q
-    log_event("quest_created", {"quest_id": quest_id, "area": q.area})
+    # Auto-join organizer? Optional, but let's say no for now to save capacity slots.
     return {"quest_id": quest_id}
-
 
 @app.get("/users/{user_id}/recommendations", response_model=List[QuestOut])
 def get_recommendations(user_id: str, k: int = 3):
     u = USERS.get(user_id)
-    if not u:
-        raise HTTPException(status_code=404, detail="User not found")
+    if not u: raise HTTPException(status_code=404, detail="User not found")
+    
+    candidates = []
+    for q in QUESTS.values():
+        if q.area != u.area: continue
+        if user_id in q.participant_ids: continue # Skip if already joined
+        if not capacity_available(q): continue
+        
+        score = 0.5 
+        if u.social_style == q.social_style: score += 0.3
+        candidates.append((q, score))
+        
+    candidates.sort(key=lambda x: x[1], reverse=True)
+    
+    out = []
+    for q, score in candidates[:k]:
+        out.append(QuestOut(
+            quest_id=q.quest_id,
+            organizer_name=get_organizer_name(q.organizer_id),
+            title=q.title,
+            description=q.description,
+            area=q.area,
+            social_style=q.social_style,
+            mode=q.mode,
+            tags=sorted(list(q.tags)),
+            start_time_iso=q.start_time.isoformat(),
+            duration_mins=q.duration_mins,
+            capacity=q.capacity,
+            participants=len(q.participant_ids),
+            score=round(score, 4),
+            has_joined=False
+        ))
+    return out
 
-    recs = recommend_quests_for_user(u, top_k=max(1, min(10, k)))
-    out: List[QuestOut] = []
-    for q, score in recs:
-        out.append(
-            QuestOut(
+@app.get("/users/{user_id}/quests", response_model=List[QuestOut])
+def get_my_quests(user_id: str):
+    # Returns quests the user has joined
+    out = []
+    for q in QUESTS.values():
+        if user_id in q.participant_ids:
+            out.append(QuestOut(
                 quest_id=q.quest_id,
+                organizer_name=get_organizer_name(q.organizer_id),
                 title=q.title,
                 description=q.description,
                 area=q.area,
@@ -370,88 +242,421 @@ def get_recommendations(user_id: str, k: int = 3):
                 duration_mins=q.duration_mins,
                 capacity=q.capacity,
                 participants=len(q.participant_ids),
-                score=round(score, 4),
-            )
-        )
-    log_event("recommendations_viewed", {"user_id": user_id, "area": u.area, "k": k})
+                has_joined=True,
+                is_completed=(user_id in q.completions)
+            ))
+    # Sort by start time
+    out.sort(key=lambda x: x.start_time_iso)
     return out
 
+@app.get("/quests", response_model=List[QuestOut])
+def list_quests():
+    out = []
+    for q in QUESTS.values():
+        out.append(QuestOut(
+            quest_id=q.quest_id,
+            organizer_name=get_organizer_name(q.organizer_id),
+            title=q.title,
+            description=q.description,
+            area=q.area,
+            social_style=q.social_style,
+            mode=q.mode,
+            tags=sorted(list(q.tags)),
+            start_time_iso=q.start_time.isoformat(),
+            duration_mins=q.duration_mins,
+            capacity=q.capacity,
+            participants=len(q.participant_ids),
+            score=None,
+        ))
+    return out
 
 @app.post("/quests/{quest_id}/join")
 def join_quest(quest_id: str, body: JoinQuest):
     q = QUESTS.get(quest_id)
-    if not q:
-        raise HTTPException(status_code=404, detail="Quest not found")
-
-    u = USERS.get(body.user_id)
-    if not u:
-        raise HTTPException(status_code=404, detail="User not found")
-
-    if u.area != q.area:
-        raise HTTPException(status_code=400, detail="User area does not match quest area")
-    if not capacity_available(q):
-        raise HTTPException(status_code=400, detail="Quest is full")
-    if body.user_id in q.participant_ids:
-        return {"ok": True, "message": "Already joined"}
-
+    if not q: raise HTTPException(status_code=404, detail="Quest not found")
+    if body.user_id in q.participant_ids: return {"ok": True, "msg": "Already joined"}
+    if not capacity_available(q): raise HTTPException(status_code=400, detail="Full")
+    
     q.participant_ids.add(body.user_id)
-
-    # first join time tracking
-    now = datetime.utcnow()
-    if u.first_join_at is None:
-        u.first_join_at = now
-    u.last_join_at = now
-
-    log_event("quest_joined", {"user_id": body.user_id, "quest_id": quest_id, "area": q.area})
     return {"ok": True}
-
 
 @app.post("/quests/{quest_id}/complete")
 def complete_quest(quest_id: str, body: CompleteQuest):
     q = QUESTS.get(quest_id)
-    if not q:
-        raise HTTPException(status_code=404, detail="Quest not found")
-
-    if body.user_id not in q.participant_ids:
-        raise HTTPException(status_code=400, detail="User has not joined this quest")
-
+    if not q: raise HTTPException(status_code=404, detail="Quest not found")
     q.completions[body.user_id] = body.connectedness_rating
-    log_event(
-        "quest_completed",
-        {"user_id": body.user_id, "quest_id": quest_id, "area": q.area, "rating": body.connectedness_rating},
-    )
     return {"ok": True}
 
+# -----------------------------
+# MODERN UI (HTML/JS/CSS)
+# -----------------------------
 
-@app.get("/dashboard/{area}", response_model=DashboardOut)
-def get_dashboard(area: str):
-    # area-level aggregated stats
-    return dashboard(area=area)
+APP_HTML = """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SideQuest</title>
+  <style>
+    :root {
+        --bg-color: #E0F7FA;
+        --card-bg: #FFFFFF;
+        --primary: #00BCD4;
+        --sidebar-bg: #006064;
+        --text-dark: #263238;
+        --accent-pink: #FF4081;
+        --accent-gold: #FFD700;
+    }
+    body { font-family: 'Segoe UI', sans-serif; background-color: var(--bg-color); margin: 0; color: var(--text-dark); }
+    
+    /* Utility */
+    .hidden { display: none !important; }
+    .btn { border: none; border-radius: 50px; padding: 12px 24px; font-weight: bold; cursor: pointer; color: white; box-shadow: 0 4px 6px rgba(0,0,0,0.1); margin-top:10px;}
+    .btn-pink { background: var(--accent-pink); }
+    .btn-blue { background: var(--primary); }
+    .btn-disabled { background: #bdc3c7; cursor: not-allowed; }
+    
+    /* Login Screen */
+    #view-auth { height: 100vh; display: flex; align-items: center; justify-content: center; background: linear-gradient(135deg, #E0F7FA, #80DEEA); }
+    .auth-card { background: white; padding: 40px; border-radius: 20px; box-shadow: 0 10px 25px rgba(0,0,0,0.1); width: 90%; max-width: 400px; text-align: center; }
+    .auth-tabs { display: flex; margin-bottom: 20px; border-bottom: 2px solid #eee; }
+    .tab { flex: 1; padding: 10px; cursor: pointer; color: #aaa; font-weight: bold; }
+    .tab.active { color: var(--primary); border-bottom: 2px solid var(--primary); }
+    .auth-input { width: 100%; padding: 12px; margin: 8px 0; border: 2px solid #ddd; border-radius: 10px; box-sizing: border-box; }
+    
+    /* App Layout */
+    #view-app { display: flex; height: 100vh; }
+    #sidebar { width: 250px; background: var(--sidebar-bg); padding: 20px; position: fixed; left: -290px; top: 0; bottom: 0; transition: left 0.3s; z-index: 1000; color: white; }
+    #sidebar.open { left: 0; }
+    .sidebar-btn { background: rgba(255,255,255,0.1); color: white; padding: 15px; margin-bottom: 10px; border-radius: 10px; cursor: pointer; display: block; width: 100%; border: none; text-align: left; }
+    .sidebar-btn:hover { background: rgba(255,255,255,0.2); }
+    
+    main { flex: 1; padding: 20px; margin: 0 auto; max-width: 1200px; width: 100%; transition: margin-left 0.3s; }
+    header { display: flex; align-items: center; margin-bottom: 30px; }
+    #hamburger { font-size: 2rem; background: none; border: none; color: var(--sidebar-bg); cursor: pointer; margin-right: 20px; }
+    
+    /* Quest Grid Output */
+    #output-area { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 20px; }
+    .quest-card { background: white; padding: 20px; border-radius: 15px; box-shadow: 0 4px 10px rgba(0,0,0,0.05); border-left: 5px solid var(--accent-pink); display: flex; flex-direction: column; }
+    .quest-card h3 { margin: 0 0 5px 0; color: var(--text-dark); }
+    .quest-card .organizer { font-size: 0.85rem; color: #888; margin-bottom: 10px; }
+    .quest-card .meta { background: #f0f4f8; padding: 5px 10px; border-radius: 8px; font-size: 0.8rem; color: #555; margin-bottom: 10px; }
+    .quest-card .desc { font-size: 0.9rem; color: #444; flex-grow: 1; margin-bottom: 15px; }
+    
+    /* Rating Stars */
+    .star-rating { display: flex; gap: 5px; justify-content: center; font-size: 1.5rem; cursor: pointer; }
+    .star { color: #ccc; transition: color 0.2s; }
+    .star:hover, .star.active { color: var(--accent-gold); }
 
+  </style>
+</head>
+<body>
 
-@app.get("/quests", response_model=List[QuestOut])
-def list_quests(area: Optional[str] = None):
-    out: List[QuestOut] = []
-    for q in QUESTS.values():
-        if area and q.area != area:
-            continue
-        out.append(
-            QuestOut(
-                quest_id=q.quest_id,
-                title=q.title,
-                description=q.description,
-                area=q.area,
-                social_style=q.social_style,
-                mode=q.mode,
-                tags=sorted(list(q.tags)),
-                start_time_iso=q.start_time.isoformat(),
-                duration_mins=q.duration_mins,
-                capacity=q.capacity,
-                participants=len(q.participant_ids),
-                score=None,
-            )
-        )
-    # upcoming first
-    out.sort(key=lambda x: x.start_time_iso)
-    return out
+  <div id="view-auth">
+    <div class="auth-card">
+      <h1 style="color:var(--primary); margin:0;">SideQuest</h1>
+      <p style="color:#aaa; margin-bottom:20px;">Your Local Adventure Awaits</p>
+      
+      <div class="auth-tabs">
+        <div id="tab-signup" class="tab active" onclick="switchTab('signup')">Sign Up</div>
+        <div id="tab-login" class="tab" onclick="switchTab('login')">Log In</div>
+      </div>
 
+      <div id="form-signup">
+        <input id="su_name" class="auth-input" placeholder="Display Name (e.g. Alex)" />
+        <input id="su_pass" type="password" class="auth-input" placeholder="Password" />
+        <select id="su_energy" class="auth-input">
+            <option value="neutral">Neutral Energy</option>
+            <option value="high">High Energy</option>
+            <option value="low">Low Energy</option>
+        </select>
+        <button class="btn btn-pink" style="width:100%" onclick="doSignup()">Create Account</button>
+      </div>
+
+      <div id="form-login" class="hidden">
+        <input id="li_name" class="auth-input" placeholder="Your Display Name" />
+        <input id="li_pass" type="password" class="auth-input" placeholder="Password" />
+        <button class="btn btn-blue" style="width:100%" onclick="doLogin()">Enter World</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="view-app" class="hidden">
+    <aside id="sidebar">
+        <h2 style="text-align:center; border-bottom:1px solid rgba(255,255,255,0.2); padding-bottom:10px;">Menu</h2>
+        <button class="sidebar-btn" onclick="navTo('hub')">🏠 Home</button>
+        <button class="sidebar-btn" onclick="navTo('myquests')">🎒 My Signed Up Quests</button>
+        <button class="sidebar-btn" onclick="navTo('recs')">✨ Recommendations</button>
+        <button class="sidebar-btn" onclick="navTo('list')">📜 All Quests</button>
+        <button class="sidebar-btn" onclick="navTo('create')">➕ Create Quest</button>
+        <button class="sidebar-btn" onclick="doLogout()">🚪 Logout</button>
+    </aside>
+
+    <main>
+        <header>
+            <button id="hamburger" onclick="toggleSidebar()">☰</button>
+            <h2 id="page-title">Home</h2>
+            <div style="margin-left:auto; font-weight:bold; color:var(--primary)">
+                Hello, <span id="display-user-name">...</span>
+            </div>
+        </header>
+
+        <div id="view-hub" class="hidden">
+            <div style="display:flex; gap:30px; justify-content:center; flex-wrap:wrap; margin-top:50px;">
+                <div style="background:white; width:280px; padding:30px; border-radius:30px; text-align:center; box-shadow:0 10px 20px rgba(0,0,0,0.1); cursor:pointer;" onclick="navTo('create')">
+                    <div style="font-size:3rem; margin-bottom:10px;">⚔️</div>
+                    <h3>Create Quest</h3>
+                    <p style="color:#888;">Host an activity</p>
+                </div>
+                <div style="background:white; width:280px; padding:30px; border-radius:30px; text-align:center; box-shadow:0 10px 20px rgba(0,0,0,0.1); cursor:pointer;" onclick="navTo('recs')">
+                    <div style="font-size:3rem; margin-bottom:10px;">🔍</div>
+                    <h3>Join Quest</h3>
+                    <p style="color:#888;">Find adventures</p>
+                </div>
+            </div>
+        </div>
+
+        <div id="view-create" class="hidden">
+            <div style="background:white; padding:30px; border-radius:20px; max-width:600px; margin:auto;">
+                <h2 style="color:var(--accent-pink); margin-top:0;">Host a Quest</h2>
+                <input class="auth-input" id="q_title" placeholder="Title (e.g. Morning Run)" />
+                <textarea class="auth-input" id="q_desc" rows="3" placeholder="Description"></textarea>
+                <div style="display:flex; gap:15px;">
+                    <div style="flex:1"><label>Duration (mins)</label><input class="auth-input" id="q_duration" type="number" value="60" /></div>
+                    <div style="flex:1"><label>Capacity</label><input class="auth-input" id="q_capacity" type="number" value="5" /></div>
+                </div>
+                <label>Start Time</label>
+                <input class="auth-input" id="q_start" type="datetime-local" />
+                <button class="btn btn-pink" style="width:100%; margin-top:20px;" onclick="apiCreateQuest()">Publish Quest</button>
+            </div>
+        </div>
+
+        <div id="view-output" class="hidden">
+            <div id="output-area"></div>
+        </div>
+    </main>
+  </div>
+
+  <script>
+    let currentUser = null; 
+
+    // --- Auth ---
+    function switchTab(mode) {
+        if(mode === 'signup') {
+            document.getElementById('tab-signup').classList.add('active');
+            document.getElementById('tab-login').classList.remove('active');
+            document.getElementById('form-signup').classList.remove('hidden');
+            document.getElementById('form-login').classList.add('hidden');
+        } else {
+            document.getElementById('tab-signup').classList.remove('active');
+            document.getElementById('tab-login').classList.add('active');
+            document.getElementById('form-signup').classList.add('hidden');
+            document.getElementById('form-login').classList.remove('hidden');
+        }
+    }
+
+    async function doSignup() {
+        const name = document.getElementById('su_name').value;
+        const pass = document.getElementById('su_pass').value;
+        if(!name || !pass) return alert("Name & Password required");
+        
+        try {
+            const res = await fetch('/users', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    display_name: name,
+                    password: pass,
+                    default_energy: document.getElementById('su_energy').value,
+                    area: "NTU"
+                })
+            });
+            if(!res.ok) throw await res.json();
+            const data = await res.json();
+            alert("Account created! Please log in.");
+            switchTab('login');
+        } catch(e) { alert("Error: " + (e.detail || e)); }
+    }
+
+    async function doLogin() {
+        const name = document.getElementById('li_name').value;
+        const pass = document.getElementById('li_pass').value;
+        
+        try {
+            const res = await fetch('/users/login', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ display_name: name, password: pass })
+            });
+            if(!res.ok) throw await res.json();
+            const data = await res.json();
+            enterApp(data);
+        } catch(e) { alert("Login Failed: " + (e.detail || "Incorrect credentials")); }
+    }
+
+    function enterApp(userData) {
+        currentUser = userData;
+        document.getElementById('display-user-name').innerText = currentUser.display_name;
+        document.getElementById('view-auth').classList.add('hidden');
+        document.getElementById('view-app').classList.remove('hidden');
+        navTo('hub');
+        
+        // Auto-fill datetime
+        const now = new Date();
+        now.setMinutes(now.getMinutes() - now.getTimezoneOffset() + 60);
+        document.getElementById('q_start').value = now.toISOString().slice(0,16);
+    }
+
+    function doLogout() {
+        location.reload();
+    }
+
+    // --- Navigation ---
+    function toggleSidebar() {
+        document.getElementById('sidebar').classList.toggle('open');
+    }
+
+    function navTo(page) {
+        document.getElementById('sidebar').classList.remove('open');
+        document.getElementById('view-hub').classList.add('hidden');
+        document.getElementById('view-create').classList.add('hidden');
+        document.getElementById('view-output').classList.add('hidden');
+        
+        const titles = {
+            'hub': 'Home', 'create': 'Create Quest', 'list': 'All Quests', 
+            'recs': 'Recommendations', 'myquests': 'My Signed Up Quests'
+        };
+        document.getElementById('page-title').innerText = titles[page] || 'SideQuest';
+
+        if(page === 'hub') document.getElementById('view-hub').classList.remove('hidden');
+        else if(page === 'create') document.getElementById('view-create').classList.remove('hidden');
+        else {
+            document.getElementById('view-output').classList.remove('hidden');
+            if(page === 'list') fetchList();
+            else if(page === 'recs') fetchRecs();
+            else if(page === 'myquests') fetchMyQuests();
+        }
+    }
+
+    // --- Logic ---
+    async function apiCreateQuest() {
+        const startVal = document.getElementById('q_start').value;
+        const payload = {
+            organizer_id: currentUser.user_id,
+            title: document.getElementById('q_title').value || "New Quest",
+            description: document.getElementById('q_desc').value || "Join us!",
+            area: currentUser.area || "NTU",
+            start_time_iso: new Date(startVal).toISOString(),
+            duration_mins: parseInt(document.getElementById('q_duration').value),
+            capacity: parseInt(document.getElementById('q_capacity').value)
+        };
+        try {
+            const res = await fetch('/quests', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
+            if(!res.ok) throw await res.json();
+            alert("Quest Created!");
+            navTo('myquests');
+        } catch(e) { alert("Error: " + e.detail); }
+    }
+
+    async function fetchList() {
+        const res = await fetch('/quests');
+        renderQuests(await res.json());
+    }
+    async function fetchRecs() {
+        const res = await fetch(`/users/${currentUser.user_id}/recommendations?k=10`);
+        renderQuests(await res.json());
+    }
+    async function fetchMyQuests() {
+        const res = await fetch(`/users/${currentUser.user_id}/quests`);
+        renderQuests(await res.json(), true);
+    }
+
+    async function joinQuest(qid) {
+        try {
+            const res = await fetch(`/quests/${qid}/join`, {
+                method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ user_id: currentUser.user_id })
+            });
+            if(!res.ok) throw await res.json();
+            alert("Joined!");
+            navTo('myquests');
+        } catch(e) { alert(e.detail); }
+    }
+
+    async function submitRating(qid, stars) {
+        try {
+            const res = await fetch(`/quests/${qid}/complete`, {
+                method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ user_id: currentUser.user_id, connectedness_rating: stars })
+            });
+            if(!res.ok) throw await res.json();
+            alert("Rated " + stars + " stars!");
+            fetchMyQuests(); // refresh UI
+        } catch(e) { alert(e.detail); }
+    }
+
+    function renderQuests(quests, isMyPage=false) {
+        const area = document.getElementById('output-area');
+        area.innerHTML = "";
+        if(!quests || quests.length === 0) {
+            area.innerHTML = "<p style='text-align:center; width:100%; color:#888'>No quests found.</p>"; return;
+        }
+
+        const now = new Date();
+
+        quests.forEach(q => {
+            const startTime = new Date(q.start_time_iso);
+            const endTime = new Date(startTime.getTime() + q.duration_mins * 60000);
+            const hasEnded = now > endTime;
+            const dateStr = startTime.toLocaleString([], {month:'short', day:'numeric', hour:'2-digit', minute:'2-digit'});
+            
+            let actionBtn = "";
+            
+            if (isMyPage) {
+                if (q.is_completed) {
+                    actionBtn = `<div style="text-align:center; color:var(--accent-gold); font-weight:bold;">★ Rated</div>`;
+                } else if (hasEnded) {
+                    // Feedback UI
+                    actionBtn = `
+                        <div style="text-align:center;">
+                            <small>Quest Ended. Rate it:</small>
+                            <div class="star-rating">
+                                <span class="star" onclick="submitRating('${q.quest_id}', 1)">★</span>
+                                <span class="star" onclick="submitRating('${q.quest_id}', 2)">★</span>
+                                <span class="star" onclick="submitRating('${q.quest_id}', 3)">★</span>
+                                <span class="star" onclick="submitRating('${q.quest_id}', 4)">★</span>
+                                <span class="star" onclick="submitRating('${q.quest_id}', 5)">★</span>
+                            </div>
+                        </div>
+                    `;
+                } else {
+                    actionBtn = `<button class="btn btn-disabled" style="width:100%">Joined (Upcoming)</button>`;
+                }
+            } else {
+                actionBtn = `<button class="btn btn-blue" style="width:100%" onclick="joinQuest('${q.quest_id}')">Join Quest</button>`;
+            }
+
+            const card = document.createElement('div');
+            card.className = 'quest-card';
+            card.innerHTML = `
+                <h3>${q.title}</h3>
+                <div class="organizer">By ${q.organizer_name}</div>
+                <div class="meta">📅 ${dateStr} • ⏳ ${q.duration_mins}m • 👥 ${q.participants}/${q.capacity}</div>
+                <div class="desc">${q.description}</div>
+                ${actionBtn}
+            `;
+            area.appendChild(card);
+        });
+    }
+  </script>
+</body>
+</html>
+"""
+
+@app.get("/", response_class=HTMLResponse)
+def root():
+    return APP_HTML
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("sidequest_app:app", host="0.0.0.0", port=8000, reload=True)
