@@ -18,16 +18,12 @@ from pydantic import BaseModel, Field
 # -----------------------------
 
 class UserCreate(BaseModel):
-    display_name: str
-    # "low" | "neutral" | "high"
-    default_energy: str = Field(default="neutral", pattern="^(low|neutral|high)$")
-    # "quiet" | "talkative" | "either"
-    social_style: str = Field(default="either", pattern="^(quiet|talkative|either)$")
-    # "online" | "offline" | "either"
-    mode: str = Field(default="either", pattern="^(online|offline|either)$")
-    interests: List[str] = Field(default_factory=list)
-    # simple location bucket for prototype (e.g. "NTU", "Jurong", "Tampines")
-    area: str = "NTU"
+    display_name: str = Field(..., example="Alex")
+    default_energy: str = Field(default="neutral", pattern="^(low|neutral|high)$", example="neutral")
+    social_style: str = Field(default="either", pattern="^(quiet|talkative|either)$", example="either")
+    mode: str = Field(default="either", pattern="^(online|offline|either)$", example="either")
+    interests: List[str] = Field(default_factory=list, example=["gaming", "reading"])
+    area: str = Field(default="NTU", example="NTU")
 
 
 class UserCheckIn(BaseModel):
